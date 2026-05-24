@@ -1,0 +1,6 @@
+{
+  "deploy": {
+    "startCommand": "node results-job.js",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}

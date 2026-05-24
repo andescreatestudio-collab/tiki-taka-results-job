@@ -1,0 +1,17 @@
+{
+  "name": "tikitaka-results-job",
+  "version": "1.0.0",
+  "description": "Job automático de sincronización de resultados WC2026",
+  "main": "results-job.js",
+  "type": "module",
+  "scripts": {
+    "start": "node results-job.js",
+    "dev": "node --watch results-job.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2"
+  }
+}
