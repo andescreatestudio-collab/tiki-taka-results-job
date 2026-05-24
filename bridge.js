@@ -26,13 +26,15 @@
 import 'dotenv/config';
 import { createClient }  from '@supabase/supabase-js';
 import cron              from 'node-cron';
+import fetch             from 'node-fetch';
 
 // ─── SWITCH PRINCIPAL ─────────────────────────────────────────────────────────
 /**
  * false → simulación (genera resultados aleatorios, sin API externa).
  * true  → API real WC2026 (activar el 11 de junio de 2026).
+ * Auto-switch automático el 11 de junio de 2026 a las 19:00 UTC (primer partido).
  */
-const USE_API = false;
+const USE_API = new Date() >= new Date('2026-06-11T19:00:00Z');
 
 // ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 const SUPABASE_URL         = process.env.SUPABASE_URL         || 'https://ruwnxeyrfvuyzddmygkd.supabase.co';
@@ -151,6 +153,89 @@ async function getApiResult(wcApiId) {
     awayPenalties: fixture.score?.penalty?.away ?? null,
     isExtraTime: apiStatus === 'ET' || apiStatus === 'AET' || apiStatus === 'PEN',
   };
+}
+
+const teamCodeMap = {
+  'Mexico': 'MEX', 'South Africa': 'RSA', 'South Korea': 'KOR', 'Korea Republic': 'KOR', 'Czechia': 'CZE', 'Czech Republic': 'CZE',
+  'Canada': 'CAN', 'Bosnia and Herzegovina': 'BIH', 'Bosnia-Herzegovina': 'BIH', 'Qatar': 'QAT', 'Switzerland': 'SUI',
+  'Brazil': 'BRA', 'Morocco': 'MAR', 'Haiti': 'HAI', 'Scotland': 'SCO',
+  'USA': 'USA', 'Paraguay': 'PAR', 'Australia': 'AUS', 'Turkey': 'TUR',
+  'Germany': 'GER', 'Curacao': 'CUW', 'Curaçao': 'CUW', 'Ivory Coast': 'CIV', "Côte d'Ivoire": 'CIV', 'Ecuador': 'ECU',
+  'Netherlands': 'NED', 'Japan': 'JPN', 'Sweden': 'SWE', 'Tunisia': 'TUN',
+  'Belgium': 'BEL', 'Egypt': 'EGY', 'Iran': 'IRN', 'IR Iran': 'IRN', 'New Zealand': 'NZL',
+  'Spain': 'ESP', 'Cape Verde': 'CPV', 'Cabo Verde': 'CPV', 'Saudi Arabia': 'KSA', 'Uruguay': 'URU',
+  'France': 'FRA', 'Senegal': 'SEN', 'Iraq': 'IRQ', 'Norway': 'NOR',
+  'Argentina': 'ARG', 'Algeria': 'ALG', 'Austria': 'AUT', 'Jordan': 'JOR',
+  'Portugal': 'POR', 'DR Congo': 'COD', 'Congo DR': 'COD', 'Uzbekistan': 'UZB', 'Colombia': 'COL',
+  'England': 'ENG', 'Croatia': 'CRO', 'Ghana': 'GHA', 'Panama': 'PAN'
+};
+
+/**
+ * Busca el fixture ID de un partido específico en API-Football por equipos
+ * y lo guarda en Supabase. Retorna el ID encontrado o null.
+ */
+async function syncSingleMatchApiId(match) {
+  const tag = `#${match.match_number} (${match.round})`;
+  console.log(`[sync] 🔄 Intentando sincronizar wc_api_id automáticamente para Partido ${tag}...`);
+
+  const dbHomeCode = match.home_team?.code;
+  const dbAwayCode = match.away_team?.code;
+
+  if (!dbHomeCode || !dbAwayCode) {
+    console.warn(`[sync] ⚠️ No se pueden obtener los códigos de los equipos para el Partido ${tag}.`);
+    return null;
+  }
+
+  try {
+    const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026`;
+    const response = await fetch(url, {
+      headers: {
+        'x-apisports-key': API_FOOTBALL_KEY,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`API-Football error: ${response.status} ${response.statusText}`);
+    }
+
+    const apiData = await response.json();
+    const fixtures = apiData.response || [];
+
+    // Buscar coincidencia
+    const matchedFixture = fixtures.find(f => {
+      const apiHomeCode = teamCodeMap[f.teams.home.name] || f.teams.home.name;
+      const apiAwayCode = teamCodeMap[f.teams.away.name] || f.teams.away.name;
+      return (
+        (dbHomeCode === apiHomeCode && dbAwayCode === apiAwayCode) ||
+        (dbHomeCode === apiAwayCode && dbAwayCode === apiHomeCode)
+      );
+    });
+
+    if (matchedFixture) {
+      const fixtureIdStr = String(matchedFixture.fixture.id);
+      console.log(`[sync] ✅ Encontrado Fixture ID ${fixtureIdStr} para el Partido ${tag} (${matchedFixture.teams.home.name} vs ${matchedFixture.teams.away.name})`);
+
+      // Actualizar en Supabase
+      const { error: updateErr } = await supabase
+        .from('matches')
+        .update({ wc_api_id: fixtureIdStr })
+        .eq('id', match.id);
+
+      if (updateErr) {
+        console.error(`[sync] ❌ Error actualizando wc_api_id en Supabase para el Partido ${tag}:`, updateErr.message);
+        return null;
+      }
+
+      return fixtureIdStr;
+    } else {
+      console.warn(`[sync] ⚠️ No se encontró ningún fixture coincidente en API-Football para el Partido ${tag} (${dbHomeCode} vs ${dbAwayCode})`);
+      return null;
+    }
+  } catch (err) {
+    console.error(`[sync] ❌ Error durante la autosincronización del Partido ${tag}:`, err.message);
+    return null;
+  }
 }
 
 /**
@@ -890,7 +975,11 @@ async function tick() {
       // Procesamos de a UNO por tick para evitar saturar la API externa.
       const { data: pendingMatches, error: fetchErr } = await supabase
         .from('matches')
-        .select('id, match_number, round, kickoff_utc, wc_api_id, home_team_id, away_team_id')
+        .select(`
+          id, match_number, round, kickoff_utc, wc_api_id, home_team_id, away_team_id,
+          home_team:teams!home_team_id(id, code, name),
+          away_team:teams!away_team_id(id, code, name)
+        `)
         .eq('status', 'scheduled')
         .lt('kickoff_utc', now.toISOString())
         .order('match_number', { ascending: true })
@@ -915,7 +1004,20 @@ async function tick() {
           if (kickoff < WC_REAL_START) {
             console.log(`[cron] Partido #${match.match_number} tiene kickoff anterior a ${WC_REAL_START.toISOString()}, ignorando (sin datos API).`);
           } else if (!match.wc_api_id) {
-            console.warn(`[cron] ⚠️ Partido #${match.match_number} no tiene wc_api_id. No se puede consultar la API.`);
+            // Auto-sincronización de wc_api_id para eliminatorias
+            const isKnockout = ['R32', 'R16', 'QF', 'SF', '3rd', 'final'].includes(match.round);
+            let syncedId = null;
+            if (isKnockout) {
+              syncedId = await syncSingleMatchApiId(match);
+            }
+            if (syncedId) {
+              match.wc_api_id = syncedId;
+              pollApiMatch(match).catch(err =>
+                console.error(`[cron] ❌ Error en pollApiMatch #${match.match_number}:`, err.message)
+              );
+            } else {
+              console.warn(`[cron] ⚠️ Partido #${match.match_number} no tiene wc_api_id y falló la autosincronización.`);
+            }
           } else {
             pollApiMatch(match).catch(err =>
               console.error(`[cron] ❌ Error en pollApiMatch #${match.match_number}:`, err.message)
