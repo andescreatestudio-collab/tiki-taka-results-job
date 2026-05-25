@@ -1,1 +1,1 @@
-worker: node results-job.js
+worker: node bridge.js

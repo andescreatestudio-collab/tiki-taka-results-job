@@ -1,6 +1,6 @@
 {
   "deploy": {
-    "startCommand": "node results-job.js",
+    "startCommand": "node bridge.js",
     "restartPolicyType": "ON_FAILURE"
   }
 }
