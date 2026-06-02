@@ -5,13 +5,16 @@
   "main": "results-job.js",
   "type": "module",
   "scripts": {
-    "start": "node results-job.js",
-    "dev": "node --watch results-job.js"
+    "start":    "node bridge.js",
+    "dev":      "node --watch bridge.js",
+    "mock-api": "node mock-api-server.cjs",
+    "test-api": "API_MODE=test node bridge.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
-    "dotenv": "^16.4.7",
-    "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2"
+    "dotenv":                "^16.4.7",
+    "express":               "^4.21.2",
+    "node-cron":             "^3.0.3",
+    "node-fetch":            "^3.3.2"
   }
 }

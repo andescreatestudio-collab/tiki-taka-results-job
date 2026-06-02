@@ -30,17 +30,47 @@ import fetch             from 'node-fetch';
 
 // ─── SWITCH PRINCIPAL ─────────────────────────────────────────────────────────
 /**
- * false → simulación (genera resultados aleatorios, sin API externa).
- * true  → API real WC2026 (activar el 11 de junio de 2026).
- * Auto-switch automático el 11 de junio de 2026 a las 19:00 UTC (primer partido).
+ * API_MODE (variable de entorno):
+ *   'test' → Usa el mock server local (mock-api-server.cjs en localhost:3001).
+ *            Ideal para probar el flujo completo de API sin consumir cuota real.
+ *   'real' → Usa API-Football real (v3.football.api-sports.io). Activar el 11/06/2026.
+ *   'sim'  → Modo simulación local: genera scores aleatorios, sin llamadas HTTP.
+ *   'auto' → Detección automática por fecha (sim antes del 11-jun-2026, real después).
+ *
+ * Ejemplo de uso:
+ *   API_MODE=test node bridge.js
+ *   API_MODE=test node bridge.js start 15
+ *   API_MODE=real node bridge.js
  */
-const USE_API = new Date() >= new Date('2026-06-11T19:00:00Z');
+const API_MODE = (process.env.API_MODE || 'auto').toLowerCase();
+
+/** URL del mock server (solo usada si API_MODE=test) */
+const MOCK_API_URL = process.env.MOCK_API_URL || 'http://localhost:3001';
+
+/**
+ * true  → Consultar una API HTTP (real o mock) para obtener resultados.
+ * false → Modo simulación local (sin llamadas HTTP externas).
+ */
+const USE_API =
+  API_MODE === 'test' ? true  :
+  API_MODE === 'real' ? true  :
+  API_MODE === 'sim'  ? false :
+  /* auto */           new Date() >= new Date('2026-06-11T19:00:00Z');
 
 // ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 const SUPABASE_URL         = process.env.SUPABASE_URL         || 'https://ruwnxeyrfvuyzddmygkd.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const API_FOOTBALL_KEY     = process.env.API_FOOTBALL_KEY     || '';
-const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
+
+/**
+ * Base URL de la API de resultados.
+ * - API_MODE=test  → mock local (mock-api-server.cjs)
+ * - API_MODE=real o auto (después del 11-jun) → API-Football real
+ */
+const API_FOOTBALL_BASE    = API_MODE === 'test'
+  ? MOCK_API_URL
+  : 'https://v3.football.api-sports.io';
+
 
 /** Fecha mínima de kickoff que consulta la API real (inicio real del torneo) */
 const WC_REAL_START        = new Date('2026-06-01T00:00:00Z');
@@ -257,6 +287,10 @@ async function pollApiMatch(match) {
    *   Intento 4+ (T+155min+): +15min (máx 20 intentos)
    */
   const nextDelay = (attempt, result) => {
+    if (API_MODE === 'test') {
+      if (attempt <= 20) return 2000; // 2 segundos en modo test
+      return null;
+    }
     if (attempt === 1) return 15 * MIN;
     if (attempt === 2) return result.isExtraTime ? 30 * MIN : 30 * MIN;
     if (attempt <= 20) return 15 * MIN;
@@ -300,9 +334,9 @@ async function pollApiMatch(match) {
         resolve(poll(delay, attempt + 1));
       } catch (err) {
         console.error(`  [API] ❌ Error partido ${tag} intento ${attempt}:`, err.message);
-        // Reintento de seguridad en 10 min ante error de red
+        // Reintento de seguridad en 10 min ante error de red (2s en modo test)
         if (attempt <= 20) {
-          resolve(poll(10 * MIN, attempt + 1));
+          resolve(poll(API_MODE === 'test' ? 2000 : 10 * MIN, attempt + 1));
         } else {
           resolve();
         }
@@ -310,9 +344,9 @@ async function pollApiMatch(match) {
     }, delayMs);
   });
 
-  // Primer intento a T+15min (nunca en el pasado)
+  // Primer intento a T+15min (nunca en el pasado, inmediato en modo test)
   const firstPollAt = kickoff + 15 * MIN;
-  const initialDelay = Math.max(firstPollAt - now, 0);
+  const initialDelay = API_MODE === 'test' ? 0 : Math.max(firstPollAt - now, 0);
   return poll(initialDelay, 1);
 }
 
@@ -646,14 +680,154 @@ async function seedNextRound(currentRound) {
 
   console.log(`\n[seedNextRound] Ronda "${currentRound}" completa → sembrando "${nextRound}"...`);
 
-  // ── FASE DE GRUPOS → R32 ──────────────────────────────────────────────────
-  if (currentRound === 'group') {
-    await seedR32FromGroups();
-    return;
+  let seededWithApi = false;
+
+  // En modo test, siempre usar lógica local directamente
+  if (API_MODE === 'test') {
+    console.log(`[seedNextRound] MODO TEST (API_MODE=test) activo. Usando lógica local directamente.`);
+  } else {
+    try {
+      console.log(`[seedNextRound] Consultando API-Football para buscar emparejamientos de la ronda "${nextRound}"...`);
+      const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026`;
+      const response = await fetch(url, {
+        headers: {
+          'x-apisports-key': API_FOOTBALL_KEY,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`API-Football responded with status ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const apiFixtures = data.response || [];
+
+      if (apiFixtures.length === 0) {
+        throw new Error('API-Football returned no fixtures.');
+      }
+
+      // Ordenar cronológicamente para tener una asignación 1-a-1 estable con match_number
+      apiFixtures.sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
+
+      // Determinar los partidos locales de la siguiente ronda a sembrar
+      let targetRounds = [nextRound];
+      if (nextRound === '3rd') {
+        targetRounds = ['3rd', 'final'];
+      }
+
+      const { data: dbMatches, error: dbMatchesErr } = await supabase
+        .from('matches')
+        .select('id, match_number, round')
+        .in('round', targetRounds)
+        .order('match_number', { ascending: true });
+
+      if (dbMatchesErr || !dbMatches || dbMatches.length === 0) {
+        throw new Error(`Error fetching local matches for round(s) ${targetRounds.join(', ')}: ${dbMatchesErr?.message}`);
+      }
+
+      // Obtener todos los equipos de la base de datos para mapeo
+      const { data: dbTeams, error: teamsErr } = await supabase
+        .from('teams')
+        .select('id, code, name');
+
+      if (teamsErr || !dbTeams) {
+        throw new Error(`Error fetching teams from Supabase: ${teamsErr?.message}`);
+      }
+
+      const teamMapByCode = {};
+      const teamMapByName = {};
+      for (const t of dbTeams) {
+        teamMapByCode[t.code] = t.id;
+        teamMapByName[t.name.toLowerCase()] = t.id;
+      }
+
+      const isRealTeamName = (name) => {
+        if (!name) return false;
+        const n = name.toLowerCase();
+        if (n === 'tbd' || n === 'to be decided' || n.includes('winner') || n.includes('runner') || n.includes('group')) {
+          return false;
+        }
+        return true;
+      };
+
+      const resolveTeamId = (apiName) => {
+        if (!isRealTeamName(apiName)) return null;
+        const code = teamCodeMap[apiName];
+        if (code && teamMapByCode[code]) {
+          return teamMapByCode[code];
+        }
+        if (teamMapByName[apiName.toLowerCase()]) {
+          return teamMapByName[apiName.toLowerCase()];
+        }
+        return null;
+      };
+
+      // Mapear fixtures correspondientes a la ronda
+      const updates = [];
+
+      for (const dbM of dbMatches) {
+        const idx = dbM.match_number - 1;
+        const fixture = apiFixtures[idx];
+
+        if (!fixture) {
+          console.warn(`[seedNextRound] No se encontró fixture de API en el índice ${idx} para Partido #${dbM.match_number}`);
+          continue;
+        }
+
+        const homeName = fixture.teams?.home?.name;
+        const awayName = fixture.teams?.away?.name;
+
+        const homeId = resolveTeamId(homeName);
+        const awayId = resolveTeamId(awayName);
+
+        if (homeId && awayId) {
+          updates.push({
+            dbMatchId: dbM.id,
+            match_number: dbM.match_number,
+            home_team_id: homeId,
+            away_team_id: awayId,
+            wc_api_id: String(fixture.fixture.id)
+          });
+        }
+      }
+
+      // Si todos los partidos requeridos tienen equipos resueltos en la API
+      if (updates.length === dbMatches.length && dbMatches.length > 0) {
+        console.log(`[seedNextRound] ¡Usando emparejamientos de API-Football para la ronda "${nextRound}"!`);
+        for (const u of updates) {
+          const { error: upErr } = await supabase
+            .from('matches')
+            .update({
+              home_team_id: u.home_team_id,
+              away_team_id: u.away_team_id,
+              wc_api_id: u.wc_api_id
+            })
+            .eq('id', u.dbMatchId);
+
+          if (upErr) {
+            console.error(`  ❌ Error sembrando Partido #${u.match_number} desde API:`, upErr.message);
+          } else {
+            console.log(`  ✅ Sembrado Partido #${u.match_number} desde API: ${u.home_team_id} vs ${u.away_team_id} (API ID: ${u.wc_api_id})`);
+          }
+        }
+        seededWithApi = true;
+      } else {
+        console.log(`[seedNextRound] API sin datos completos (solo ${updates.length}/${dbMatches.length} partidos resueltos en API), usando lógica local como fallback.`);
+      }
+    } catch (e) {
+      console.error(`[seedNextRound] Error consultando o procesando API, usando lógica local como fallback:`, e.message);
+    }
   }
 
-  // ── RONDAS KNOCKOUT (R32 → R16 → QF → SF → 3rd/final) ───────────────────
-  await seedKnockoutRound(currentRound, nextRound);
+  // Fallback a lógica local si la API no sembró la ronda
+  if (!seededWithApi) {
+    if (currentRound === 'group') {
+      await seedR32FromGroups();
+    } else {
+      await seedKnockoutRound(currentRound, nextRound);
+    }
+  }
 }
 
 /**
@@ -971,9 +1145,10 @@ async function tick() {
         }
       }
     } else {
-      // ── MODO REAL ──
-      // Procesamos de a UNO por tick para evitar saturar la API externa.
-      const { data: pendingMatches, error: fetchErr } = await supabase
+      // ── MODO REAL / TEST ──
+      // En modo real, procesamos de a UNO por tick para evitar saturar la API externa.
+      // En modo test, procesamos TODOS los partidos cuyo kickoff ya pasó.
+      const query = supabase
         .from('matches')
         .select(`
           id, match_number, round, kickoff_utc, wc_api_id, home_team_id, away_team_id,
@@ -982,8 +1157,13 @@ async function tick() {
         `)
         .eq('status', 'scheduled')
         .lt('kickoff_utc', now.toISOString())
-        .order('match_number', { ascending: true })
-        .limit(1);
+        .order('match_number', { ascending: true });
+
+      if (API_MODE !== 'test') {
+        query.limit(1);
+      }
+
+      const { data: pendingMatches, error: fetchErr } = await query;
 
       if (fetchErr) {
         console.error('[cron] ❌ Error al buscar partidos pendientes:', fetchErr.message);
@@ -993,15 +1173,36 @@ async function tick() {
       if (!pendingMatches || pendingMatches.length === 0) {
         console.log('[cron] Sin partidos pendientes en este tick.');
       } else {
-        const match = pendingMatches[0];
+        console.log(`[cron] Encontrados ${pendingMatches.length} partidos pendientes para procesar.`);
 
-        if (!match.home_team_id || !match.away_team_id) {
-          console.log(`[cron] Partido #${match.match_number} (${match.round}) aún sin equipos sembrados. Esperando...`);
-        } else {
+        for (const match of pendingMatches) {
+          // Validar que todas las rondas previas estén 100% terminadas antes de procesar este partido.
+          // Esto evita que en modo test procesemos octavos si todavía no terminó dieciseisavos.
+          const roundIdx = ROUND_ORDER.indexOf(match.round);
+          let prevRoundsComplete = true;
+          for (let rIdx = 0; rIdx < roundIdx; rIdx++) {
+            const prevRound = ROUND_ORDER[rIdx];
+            const isPrevComplete = await isRoundComplete(prevRound);
+            if (!isPrevComplete) {
+              prevRoundsComplete = false;
+              break;
+            }
+          }
+
+          if (!prevRoundsComplete) {
+            console.log(`[cron] Partido #${match.match_number} (${match.round}) en espera porque la ronda anterior no ha terminado.`);
+            continue;
+          }
+
+          if (!match.home_team_id || !match.away_team_id) {
+            console.log(`[cron] Partido #${match.match_number} (${match.round}) aún sin equipos sembrados. Saltando por ahora.`);
+            continue;
+          }
+
           console.log(`[cron] Procesando Partido #${match.match_number} (${match.round}) — kickoff: ${match.kickoff_utc}`);
           const kickoff = new Date(match.kickoff_utc);
 
-          if (kickoff < WC_REAL_START) {
+          if (kickoff < WC_REAL_START && API_MODE !== 'test') {
             console.log(`[cron] Partido #${match.match_number} tiene kickoff anterior a ${WC_REAL_START.toISOString()}, ignorando (sin datos API).`);
           } else if (!match.wc_api_id) {
             // Auto-sincronización de wc_api_id para eliminatorias
@@ -1300,12 +1501,18 @@ console.log('╔═════════════════════�
 console.log('║   TikiTaka — Bridge v2.0 (Resultados)        ║');
 console.log('╚══════════════════════════════════════════════╝');
 
-if (USE_API) {
+if (API_MODE === 'test') {
+  console.log('🔬 MODO TEST — Consumiendo mock server local (API-Football fake)');
+  console.log(`   Mock URL:          ${MOCK_API_URL}`);
+  console.log(`   Iniciar el mock:   node mock-api-server.cjs`);
+} else if (USE_API) {
   console.log('⚽ MODO API REAL — Consultando API-Football en vivo');
-  console.log(`   API-Football Key: ${API_FOOTBALL_KEY.substring(0, 8)}...`);
+  console.log(`   API-Football URL:  ${API_FOOTBALL_BASE}`);
+  console.log(`   API Key:           ${API_FOOTBALL_KEY.substring(0, 8)}...`);
 } else {
-  console.log('🧪 MODO SIMULACIÓN — Resultados aleatorios generados por bridge.js');
-  console.log('   → Cambia USE_API = true el 11 de junio de 2026 para el Mundial real.');
+  console.log('🧪 MODO SIMULACIÓN — Resultados aleatorios (sin llamadas HTTP)');
+  console.log(`   API_MODE actual:   ${API_MODE}`);
+  console.log('   Cambiar: API_MODE=real el 11-jun-2026 o API_MODE=test para usar mock.');
 }
 
 console.log(`   Supabase URL: ${SUPABASE_URL}`);
