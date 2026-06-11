@@ -1494,6 +1494,147 @@ async function startSimulation(durationMinutes) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  SYNC DIARIO DE KICKOFFS (API-Football → Supabase)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mapa de nombres de equipos en inglés (API-Football) al español usado en la DB.
+ */
+const NOMBRE_MAP = {
+  'Mexico': 'México', 'South Africa': 'Sudáfrica', 'South Korea': 'Corea del Sur',
+  'Czech Republic': 'Chequia', 'Czechia': 'Chequia', 'Canada': 'Canadá',
+  'Bosnia': 'Bosnia-Herzegovina', 'Bosnia & Herzegovina': 'Bosnia-Herzegovina',
+  'United States': 'USA', 'Haiti': 'Haití', 'Scotland': 'Escocia',
+  'Turkey': 'Turquía', 'Türkiye': 'Turquía', 'Brazil': 'Brasil',
+  'Morocco': 'Marruecos', 'Switzerland': 'Suiza', "Ivory Coast": 'Costa de Marfil',
+  "Cote d'Ivoire": 'Costa de Marfil', 'Germany': 'Alemania', 'Curaçao': 'Curazao',
+  'Curacao': 'Curazao', 'Norway': 'Noruega', 'Algeria': 'Argelia', 'Jordan': 'Jordania',
+  'Panama': 'Panamá', 'England': 'Inglaterra', 'Croatia': 'Croacia',
+  'DR Congo': 'Congo DR', 'Uzbekistan': 'Uzbekistán', 'Netherlands': 'Países Bajos',
+  'Sweden': 'Suecia', 'Tunisia': 'Túnez', 'Japan': 'Japón', 'Cape Verde': 'Cabo Verde',
+  'Cape Verde Islands': 'Cabo Verde', 'Spain': 'España', 'Saudi Arabia': 'Arabia Saudita',
+  'Belgium': 'Bélgica', 'Iran': 'Irán', 'New Zealand': 'Nueva Zelanda', 'Egypt': 'Egipto',
+  'France': 'Francia', 'Paraguay': 'Paraguay', 'Australia': 'Australia',
+  'Ecuador': 'Ecuador', 'Portugal': 'Portugal', 'Colombia': 'Colombia',
+  'Uruguay': 'Uruguay', 'Argentina': 'Argentina', 'Qatar': 'Qatar', 'Iraq': 'Iraq',
+  'Senegal': 'Senegal', 'Ghana': 'Ghana', 'Austria': 'Austria',
+};
+
+/**
+ * Sincroniza kickoff_utc y wc_api_id de todos los partidos con datos de API-Football.
+ * Se ejecuta al arrancar y luego cada 24 horas.
+ *
+ * Flujo:
+ *   1. GET /fixtures?league=1&season=2026  → lista completa de fixtures de la API.
+ *   2. SELECT matches con sus equipos desde Supabase.
+ *   3. Para cada partido con home y away conocidos, buscar el fixture coincidente
+ *      por nombre español (usando NOMBRE_MAP).
+ *   4. Si encontró → comparar kickoff_utc y wc_api_id; actualizar solo si cambiaron.
+ *   5. Loggear resumen.
+ */
+async function syncFixtures() {
+  console.log('\n[syncFixtures] ⏳ Iniciando sincronización de kickoffs desde API-Football...');
+
+  // ── 1. Obtener fixtures de la API ──────────────────────────────────────────
+  let apiFixtures = [];
+  try {
+    const url = 'https://v3.football.api-sports.io/fixtures?league=1&season=2026';
+    const response = await fetch(url, {
+      headers: {
+        'x-rapidapi-key': process.env.API_FOOTBALL_KEY,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`API-Football respondió con ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    apiFixtures = data.response || [];
+    console.log(`[syncFixtures] ✅ ${apiFixtures.length} fixtures obtenidos de API-Football.`);
+  } catch (err) {
+    console.error('[syncFixtures] ❌ Error al obtener fixtures de API-Football:', err.message);
+    return;
+  }
+
+  if (apiFixtures.length === 0) {
+    console.warn('[syncFixtures] ⚠️  La API no devolvió fixtures. Abortando sync.');
+    return;
+  }
+
+  // Construir índice: "homeEs|awayEs" → fixture (para búsqueda rápida)
+  const fixtureIndex = new Map();
+  for (const f of apiFixtures) {
+    const homeEn = f.teams?.home?.name || '';
+    const awayEn = f.teams?.away?.name || '';
+    const homeEs = NOMBRE_MAP[homeEn] || homeEn;
+    const awayEs = NOMBRE_MAP[awayEn] || awayEn;
+    // Indexar por ambas direcciones para mayor robustez
+    fixtureIndex.set(`${homeEs}|${awayEs}`, f);
+    fixtureIndex.set(`${awayEs}|${homeEs}`, f);
+  }
+
+  // ── 2. Obtener partidos con sus equipos desde Supabase ────────────────────
+  const { data: dbMatches, error: dbErr } = await supabase
+    .from('matches')
+    .select(`
+      id,
+      wc_api_id,
+      kickoff_utc,
+      t1:home_team_id ( name ),
+      t2:away_team_id ( name )
+    `);
+
+  if (dbErr || !dbMatches) {
+    console.error('[syncFixtures] ❌ Error al consultar matches en Supabase:', dbErr?.message);
+    return;
+  }
+
+  // ── 3. Cruzar y actualizar ────────────────────────────────────────────────
+  let updated = 0;
+
+  for (const match of dbMatches) {
+    const homeName = match.t1?.name;
+    const awayName = match.t2?.name;
+
+    // Saltar partidos sin equipos asignados aún
+    if (!homeName || !awayName) continue;
+
+    const key = `${homeName}|${awayName}`;
+    const fixture = fixtureIndex.get(key);
+
+    if (!fixture) continue; // No se encontró coincidencia en la API
+
+    const apiKickoff  = fixture.fixture?.date   ? new Date(fixture.fixture.date).toISOString() : null;
+    const apiFixtureId = fixture.fixture?.id     ? String(fixture.fixture.id) : null;
+
+    const needsUpdate =
+      (apiKickoff  && apiKickoff  !== match.kickoff_utc)  ||
+      (apiFixtureId && apiFixtureId !== match.wc_api_id);
+
+    if (!needsUpdate) continue;
+
+    const updatePayload = {};
+    if (apiKickoff  && apiKickoff  !== match.kickoff_utc)  updatePayload.kickoff_utc = apiKickoff;
+    if (apiFixtureId && apiFixtureId !== match.wc_api_id)  updatePayload.wc_api_id   = apiFixtureId;
+
+    const { error: upErr } = await supabase
+      .from('matches')
+      .update(updatePayload)
+      .eq('id', match.id);
+
+    if (upErr) {
+      console.error(`[syncFixtures] ❌ Error actualizando partido ${match.id} (${homeName} vs ${awayName}):`, upErr.message);
+    } else {
+      updated++;
+    }
+  }
+
+  console.log(`[syncFixtures] ✅ Actualizados: ${updated} partidos.`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  ARRANQUE
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1531,6 +1672,10 @@ if (startIdx !== -1) {
     tick();
     cron.schedule('* * * * *', tick);
     console.log('[OK] Cron activo — verificando cada 1 minuto.\n');
+
+    // Sync diario de kickoffs (al arrancar + cada 24h)
+    syncFixtures();
+    setInterval(syncFixtures, 24 * 60 * 60 * 1000);
   }).catch(err => {
     console.error('❌ Error fatal al iniciar simulación:', err);
     process.exit(1);
@@ -1542,4 +1687,8 @@ if (startIdx !== -1) {
   // Cron cada 1 minuto
   cron.schedule('* * * * *', tick);
   console.log('[OK] Cron activo — verificando cada 1 minuto.\n');
+
+  // Sync diario de kickoffs (al arrancar + cada 24h)
+  syncFixtures();
+  setInterval(syncFixtures, 24 * 60 * 60 * 1000);
 }
