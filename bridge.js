@@ -153,7 +153,8 @@ async function getApiResult(wcApiId) {
 
   const response = await fetch(url, {
     headers: {
-      'x-apisports-key': API_FOOTBALL_KEY,
+      'x-rapidapi-key': API_FOOTBALL_KEY,
+      'x-rapidapi-host': 'v3.football.api-sports.io',
       'Content-Type': 'application/json',
     },
   });
@@ -220,7 +221,8 @@ async function syncSingleMatchApiId(match) {
     const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026`;
     const response = await fetch(url, {
       headers: {
-        'x-apisports-key': API_FOOTBALL_KEY,
+        'x-rapidapi-key': API_FOOTBALL_KEY,
+        'x-rapidapi-host': 'v3.football.api-sports.io',
         'Content-Type': 'application/json',
       },
     });
@@ -343,6 +345,9 @@ async function pollApiMatch(match) {
       }
     }, delayMs);
   });
+
+  // Marcar como in_progress para evitar que el cron lance pollings duplicados
+  await supabase.from('matches').update({ status: 'in_progress' }).eq('id', match.id);
 
   // Primer intento a T+15min (nunca en el pasado, inmediato en modo test)
   const firstPollAt = kickoff + 15 * MIN;
@@ -691,7 +696,8 @@ async function seedNextRound(currentRound) {
       const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026`;
       const response = await fetch(url, {
         headers: {
-          'x-apisports-key': API_FOOTBALL_KEY,
+          'x-rapidapi-key': API_FOOTBALL_KEY,
+          'x-rapidapi-host': 'v3.football.api-sports.io',
           'Content-Type': 'application/json',
         },
       });
