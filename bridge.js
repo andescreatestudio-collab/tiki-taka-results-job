@@ -1698,3 +1698,78 @@ if (startIdx !== -1) {
   syncFixtures();
   setInterval(syncFixtures, 24 * 60 * 60 * 1000);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  BACKUP DE RESULTADOS (cada 30 minutos)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Respaldo de resultados: consulta API-Football para cualquier partido
+ * scheduled o in_progress cuyo kickoff_utc sea mayor a 115 minutos atrás
+ * y que tenga wc_api_id. Si el partido ya terminó (FT/AET/PEN), guarda
+ * el resultado y calcula puntos.
+ *
+ * Cubre el caso en que el polling principal de bridge.js falle o no arranque
+ * correctamente para algún partido.
+ */
+async function autoResultsBackup() {
+  console.log('\n[auto-results] ─── Check backup ───');
+  const cutoff = new Date(Date.now() - 115 * 60 * 1000).toISOString();
+
+  const { data: matches } = await supabase
+    .from('matches')
+    .select('id, match_number, round, wc_api_id, kickoff_utc, status')
+    .in('status', ['scheduled', 'in_progress'])
+    .lt('kickoff_utc', cutoff)
+    .not('wc_api_id', 'is', null)
+    .order('kickoff_utc', { ascending: true });
+
+  if (!matches || matches.length === 0) return;
+
+  for (const match of matches) {
+    try {
+      const res = await fetch(
+        `https://v3.football.api-sports.io/fixtures?league=1&season=2026&id=${match.wc_api_id}`,
+        {
+          headers: {
+            'x-rapidapi-key': API_FOOTBALL_KEY,
+            'x-rapidapi-host': 'v3.football.api-sports.io',
+          },
+        }
+      );
+      const data = await res.json();
+      const fixture = data.response?.[0];
+      if (!fixture) continue;
+
+      const status = fixture.fixture?.status?.short;
+      if (!['FT', 'AET', 'PEN'].includes(status)) continue;
+
+      const homeScore = fixture.goals?.home;
+      const awayScore = fixture.goals?.away;
+      if (homeScore === null || awayScore === null) continue;
+
+      await supabase
+        .from('matches')
+        .update({
+          home_score:     homeScore,
+          away_score:     awayScore,
+          home_penalties: fixture.score?.penalty?.home ?? null,
+          away_penalties: fixture.score?.penalty?.away ?? null,
+          status:         'finished',
+        })
+        .eq('id', match.id);
+
+      await supabase.rpc('calcular_puntos_partido', { p_match_id: match.id });
+      console.log(`[auto-results] ✅ Partido #${match.match_number} → ${homeScore}-${awayScore}`);
+
+      // Pausa de 1.5s entre peticiones para no saturar la API
+      await new Promise(r => setTimeout(r, 1500));
+    } catch (e) {
+      console.error(`[auto-results] ❌ Partido #${match.match_number}:`, e.message);
+    }
+  }
+}
+
+// Correr backup cada 30 minutos
+setInterval(autoResultsBackup, 30 * 60 * 1000);
+autoResultsBackup(); // primer check inmediato
