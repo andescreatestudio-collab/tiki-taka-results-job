@@ -1716,7 +1716,7 @@ async function autoResultsBackup() {
   console.log('\n[auto-results] ─── Check backup ───');
   const cutoff = new Date(Date.now() - 115 * 60 * 1000).toISOString();
 
-  const { data: matches } = await supabase
+  const { data: matches, error: matchesError } = await supabase
     .from('matches')
     .select('id, match_number, round, wc_api_id, kickoff_utc, status')
     .in('status', ['scheduled', 'in_progress'])
@@ -1724,7 +1724,16 @@ async function autoResultsBackup() {
     .not('wc_api_id', 'is', null)
     .order('kickoff_utc', { ascending: true });
 
-  if (!matches || matches.length === 0) return;
+  if (matchesError) {
+    console.error('[auto-results] ❌ Error Supabase:', matchesError.message);
+    return;
+  }
+
+  if (!matches || matches.length === 0) {
+    console.log('[auto-results] ✅ Sin partidos pendientes.');
+    return;
+  }
+
 
   for (const match of matches) {
     try {
