@@ -149,7 +149,7 @@ function getSimulationResult(match) {
  * @returns {Promise<{ status: string, homeScore: number|null, awayScore: number|null, homePenalties: number|null, awayPenalties: number|null, isExtraTime: boolean }>}
  */
 async function getApiResult(wcApiId) {
-  const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026&id=${wcApiId}`;
+  const url = `${API_FOOTBALL_BASE}/fixtures?id=${wcApiId}`;
 
   const response = await fetch(url, {
     headers: {
