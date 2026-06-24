@@ -183,6 +183,7 @@ async function getApiResult(wcApiId) {
     homePenalties: fixture.score?.penalty?.home ?? null,
     awayPenalties: fixture.score?.penalty?.away ?? null,
     isExtraTime: apiStatus === 'ET' || apiStatus === 'AET' || apiStatus === 'PEN',
+    rawFixture: fixture,
   };
 }
 
@@ -1278,6 +1279,70 @@ async function checkAndSeedRounds() {
   }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  ACTUALIZACIÓN EN VIVO (cada 1 minuto)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Consulta la API para actualizar marcadores de partidos que se están jugando.
+ */
+async function updateLiveScores() {
+  if (!USE_API) {
+    return;
+  }
+
+  try {
+    const { data: liveMatches, error: dbErr } = await supabase
+      .from('matches')
+      .select('id, wc_api_id')
+      .lte('kickoff_utc', new Date().toISOString())
+      .not('status', 'in', '("FT","AET","PEN","finished")')
+      .not('wc_api_id', 'is', null);
+
+    if (dbErr) {
+      console.error('[updateLiveScores] ❌ Error consultando partidos activos:', dbErr.message);
+      return;
+    }
+
+    if (!liveMatches || liveMatches.length === 0) {
+      console.log('[updateLiveScores] No hay partidos activos, saltando.');
+      return;
+    }
+
+    console.log(`[updateLiveScores] Actualizando ${liveMatches.length} partido(s) en vivo...`);
+
+    for (const match of liveMatches) {
+      try {
+        const apiResult = await getApiResult(match.wc_api_id);
+        const fixture = apiResult.rawFixture;
+
+        if (!fixture) {
+          console.warn(`[updateLiveScores] ⚠️ No se obtuvo el fixture para el partido ID ${match.id} (wc_api_id: ${match.wc_api_id})`);
+          continue;
+        }
+
+        await supabase
+          .from('matches')
+          .update({
+            home_score: fixture.goals?.home ?? 0,
+            away_score: fixture.goals?.away ?? 0,
+            home_penalties: fixture.score?.penalty?.home,
+            away_penalties: fixture.score?.penalty?.away,
+            status: fixture.fixture?.status?.short
+          })
+          .eq('id', match.id);
+
+        const elapsed = fixture.fixture?.status?.elapsed;
+        const elapsedStr = elapsed !== null && elapsed !== undefined ? ` (${elapsed}')` : '';
+        console.log(`[updateLiveScores] Partido ${match.id} actualizado: ${fixture.goals?.home ?? 0}-${fixture.goals?.away ?? 0}${elapsedStr}`);
+      } catch (err) {
+        console.error(`[updateLiveScores] ❌ Error al actualizar partido ${match.id}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error('[updateLiveScores] ❌ Error general en updateLiveScores:', error.message);
+  }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  INICIALIZACIÓN DE LA SIMULACIÓN COMPLETA
@@ -1676,7 +1741,9 @@ if (startIdx !== -1) {
   startSimulation(validDuration).then(() => {
     // Iniciar el cron y tick inicial
     tick();
+    updateLiveScores();
     cron.schedule('* * * * *', tick);
+    cron.schedule('* * * * *', updateLiveScores);
     console.log('[OK] Cron activo — verificando cada 1 minuto.\n');
 
     // Sync diario de kickoffs (al arrancar + cada 24h)
@@ -1689,9 +1756,11 @@ if (startIdx !== -1) {
 } else {
   // Ejecutar un tick inmediato al arrancar normal
   tick();
+  updateLiveScores();
 
   // Cron cada 1 minuto
   cron.schedule('* * * * *', tick);
+  cron.schedule('* * * * *', updateLiveScores);
   console.log('[OK] Cron activo — verificando cada 1 minuto.\n');
 
   // Sync diario de kickoffs (al arrancar + cada 24h)
