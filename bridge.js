@@ -374,7 +374,8 @@ async function calculateEarlyPickBonus() {
       .eq('match_number', 104)
       .single();
 
-    if (finalErr || !finalMatch || finalMatch.status !== 'finished') {
+    const isFinalFinished = ['FT', 'AET', 'PEN', 'finished'].includes(finalMatch?.status);
+    if (finalErr || !finalMatch || !isFinalFinished) {
       console.log('  ⚠️ No se puede calcular bonus aún: el partido de la Final no está terminado o no se encontró.');
       return;
     }
@@ -548,7 +549,7 @@ async function processMatch(match, result) {
       away_score:      awayScore,
       home_penalties:  homePenalties,
       away_penalties:  awayPenalties,
-      status:          'finished',
+      status:          'FT',
     })
     .eq('id', match.id);
 
@@ -591,7 +592,7 @@ async function isRoundComplete(round) {
     .from('matches')
     .select('id')
     .eq('round', round)
-    .neq('status', 'finished')
+    .not('status', 'in', '("FT","AET","PEN","finished")')
     .limit(1);
 
   if (error) {
@@ -847,7 +848,7 @@ async function seedR32FromGroups() {
     .from('matches')
     .select('id, match_number, round, group_name, home_team_id, away_team_id, home_score, away_score')
     .eq('round', 'group')
-    .eq('status', 'finished');
+    .in('status', ['FT', 'AET', 'PEN', 'finished']);
 
   if (error) {
     console.error('  ❌ [seedR32] Error al obtener partidos de grupo:', error.message);
@@ -945,7 +946,7 @@ async function seedKnockoutRound(prevRound, nextRound) {
     .from('matches')
     .select('id, match_number, home_team_id, away_team_id, home_score, away_score, home_penalties, away_penalties')
     .eq('round', prevRound)
-    .eq('status', 'finished')
+    .in('status', ['FT', 'AET', 'PEN', 'finished'])
     .order('match_number', { ascending: true });
 
   if (prevErr || !prevMatches) {
@@ -1259,7 +1260,7 @@ async function checkAndSeedRounds() {
         .from('matches')
         .select('id')
         .eq('round', round)
-        .neq('status', 'finished')
+        .not('status', 'in', '("FT","AET","PEN","finished")')
         .limit(5);
 
       console.log(`[cron] Ronda "${round}" en curso (${pending?.length || '?'}+ partidos pendientes). Próxima siembra en espera.`);
@@ -1834,7 +1835,7 @@ async function autoResultsBackup() {
           away_score:     awayScore,
           home_penalties: fixture.score?.penalty?.home ?? null,
           away_penalties: fixture.score?.penalty?.away ?? null,
-          status:         'finished',
+          status:         'FT',
         })
         .eq('id', match.id);
 
