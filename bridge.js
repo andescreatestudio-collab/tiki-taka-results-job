@@ -1408,7 +1408,7 @@ async function startSimulation(durationMinutes) {
         home_score_pred: Math.floor(Math.random() * 5),
         away_score_pred: Math.floor(Math.random() * 5),
         is_locked:       false,
-        points_earned:   0,
+        points_earned:   null,
       });
     }
   }
