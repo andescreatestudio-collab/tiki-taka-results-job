@@ -1324,11 +1324,12 @@ async function updateLiveScores() {
         await supabase
           .from('matches')
           .update({
-            home_score: fixture.goals?.home ?? 0,
-            away_score: fixture.goals?.away ?? 0,
-            home_penalties: fixture.score?.penalty?.home,
-            away_penalties: fixture.score?.penalty?.away,
-            status: fixture.fixture?.status?.short
+            home_score: fixture.goals.home ?? 0,
+            away_score: fixture.goals.away ?? 0,
+            home_penalties: fixture.score.penalty.home,
+            away_penalties: fixture.score.penalty.away,
+            status: fixture.fixture.status.short,
+            elapsed: fixture.fixture.status.elapsed ?? null
           })
           .eq('id', match.id);
 
