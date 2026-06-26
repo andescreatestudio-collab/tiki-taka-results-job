@@ -1295,7 +1295,7 @@ async function updateLiveScores() {
   try {
     const { data: liveMatches, error: dbErr } = await supabase
       .from('matches')
-      .select('id, wc_api_id')
+      .select('id, wc_api_id, status')
       .lte('kickoff_utc', new Date().toISOString())
       .not('status', 'in', '("FT","AET","PEN","finished")')
       .not('wc_api_id', 'is', null);
@@ -1333,6 +1333,18 @@ async function updateLiveScores() {
             elapsed: fixture.fixture.status.elapsed ?? null
           })
           .eq('id', match.id);
+
+        const newStatus = fixture.fixture.status.short;
+        if (match.status !== newStatus && ['FT', 'AET', 'PEN'].includes(newStatus)) {
+          const { error: rpcError } = await supabase.rpc('calcular_puntos_partido', {
+            p_match_id: match.id,
+          });
+          if (rpcError) {
+            console.error(`[updateLiveScores] ❌ RPC calcular_puntos_partido:`, rpcError.message);
+          } else {
+            console.log(`[updateLiveScores] ✅ Puntos calculados para partido ${match.id}`);
+          }
+        }
 
         const elapsed = fixture.fixture?.status?.elapsed;
         const elapsedStr = elapsed !== null && elapsed !== undefined ? ` (${elapsed}')` : '';
