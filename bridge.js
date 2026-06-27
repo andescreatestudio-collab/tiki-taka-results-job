@@ -1335,14 +1335,23 @@ async function updateLiveScores() {
           .eq('id', match.id);
 
         const newStatus = fixture.fixture.status.short;
-        if (match.status !== newStatus && ['FT', 'AET', 'PEN'].includes(newStatus)) {
-          const { error: rpcError } = await supabase.rpc('calcular_puntos_partido', {
-            p_match_id: match.id,
-          });
-          if (rpcError) {
-            console.error(`[updateLiveScores] ❌ RPC calcular_puntos_partido:`, rpcError.message);
-          } else {
-            console.log(`[updateLiveScores] ✅ Puntos calculados para partido ${match.id}`);
+        if (['FT', 'AET', 'PEN'].includes(newStatus)) {
+          // Verificar si hay predicciones sin procesar
+          const { count } = await supabase
+            .from('predictions')
+            .select('id', { count: 'exact', head: true })
+            .eq('match_id', match.id)
+            .is('points_earned', null);
+
+          if (count > 0) {
+            const { error: rpcError } = await supabase.rpc('calcular_puntos_partido', {
+              p_match_id: match.id,
+            });
+            if (rpcError) {
+              console.error(`[updateLiveScores] ❌ RPC error:`, rpcError.message);
+            } else {
+              console.log(`[updateLiveScores] ✅ Puntos calculados para partido ${match.id}`);
+            }
           }
         }
 
