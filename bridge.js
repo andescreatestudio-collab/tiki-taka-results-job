@@ -2155,12 +2155,13 @@ if (startIdx !== -1) {
     syncFixtures();
     setInterval(syncFixtures, 24 * 60 * 60 * 1000);
 
-    // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
+    // Sync de emparejamientos de eliminatoria (al arrancar + cada 1h)
     syncKnockoutFixtures();
-    setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
+    setInterval(syncKnockoutFixtures, 1 * 60 * 60 * 1000);
 
-    // Corrección de wc_api_id incorrectos — solo una vez al arrancar
+    // Corrección de wc_api_id incorrectos (al arrancar + cada 1h)
     fixKnockoutApiIds();
+    setInterval(fixKnockoutApiIds, 1 * 60 * 60 * 1000);
   }).catch(err => {
     console.error('❌ Error fatal al iniciar simulación:', err);
     process.exit(1);
@@ -2179,12 +2180,13 @@ if (startIdx !== -1) {
   syncFixtures();
   setInterval(syncFixtures, 24 * 60 * 60 * 1000);
 
-  // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
+  // Sync de emparejamientos de eliminatoria (al arrancar + cada 1h)
   syncKnockoutFixtures();
-  setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
+  setInterval(syncKnockoutFixtures, 1 * 60 * 60 * 1000);
 
-  // Corrección de wc_api_id incorrectos — solo una vez al arrancar
+  // Corrección de wc_api_id incorrectos (al arrancar + cada 1h)
   fixKnockoutApiIds();
+  setInterval(fixKnockoutApiIds, 1 * 60 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
