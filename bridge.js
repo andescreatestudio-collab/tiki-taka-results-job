@@ -1881,6 +1881,149 @@ async function syncKnockoutFixtures() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  CORRECIÓN DE wc_api_id INCORRECTOS EN ELIMINATORIA
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Corrige los wc_api_id incorrectos de los partidos de eliminatoria
+ * cruzando la lista completa de fixtures del Mundial 2026 (API-Football)
+ * con los partidos en Supabase por nombre de equipos.
+ *
+ * Flujo:
+ *   1. GET /fixtures?league=1&season=2026  → todos los fixtures del torneo.
+ *   2. Filtrar solo partidos de eliminatoria (excluir "Group Stage").
+ *   3. Construir mapa (homeEs|awayEs) → fixture desde la API.
+ *   4. Obtener matches de Supabase con sus equipos.
+ *   5. Cruzar por nombre de equipo (español); si el wc_api_id o kickoff difieren → actualizar.
+ *
+ * Se llama UNA sola vez al arrancar, después de syncKnockoutFixtures.
+ * No requiere wc_api_id previo en la BD; trabaja solo por nombre de equipo.
+ */
+async function fixKnockoutApiIds() {
+  if (!USE_API) {
+    console.log('[fixKnockoutIds] ℹ️  Modo simulación — corrección de IDs omitida.');
+    return;
+  }
+
+  console.log('\n[fixKnockoutIds] ⏳ Corrigiendo wc_api_id de eliminatorias desde API-Football...');
+
+  // ── 1. Obtener todos los fixtures del Mundial 2026 ──────────────────────
+  let allFixtures = [];
+  try {
+    const url = `${API_FOOTBALL_BASE}/fixtures?league=1&season=2026`;
+    const response = await fetch(url, {
+      headers: {
+        'x-rapidapi-key': API_FOOTBALL_KEY,
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+        'Content-Type': 'application/json',
+      },
+    });
+    if (!response.ok) throw new Error(`API-Football ${response.status} ${response.statusText}`);
+    const data = await response.json();
+    allFixtures = data.response || [];
+    console.log(`[fixKnockoutIds] 📊 ${allFixtures.length} fixtures obtenidos de API-Football.`);
+  } catch (err) {
+    console.error('[fixKnockoutIds] ❌ Error al consultar API-Football:', err.message);
+    return;
+  }
+
+  if (allFixtures.length === 0) {
+    console.warn('[fixKnockoutIds] ⚠️  La API no devolvió fixtures. Abortando.');
+    return;
+  }
+
+  // ── 2. Filtrar solo fixtures de eliminatoria ──────────────────────────
+  const knockoutFixtures = allFixtures.filter(f =>
+    !f.league?.round?.toLowerCase().includes('group')
+  );
+  console.log(`[fixKnockoutIds] 🏆 ${knockoutFixtures.length} fixtures de eliminatoria identificados.`);
+
+  // ── 3. Construir índice (homeEs|awayEs) → fixture ──────────────────────
+  // Usa NOMBRE_MAP para convertir nombres inglés→español como en la BD.
+  const apiIndex = new Map();
+  for (const f of knockoutFixtures) {
+    const homeEn = f.teams?.home?.name || '';
+    const awayEn = f.teams?.away?.name || '';
+    const homeEs = NOMBRE_MAP[homeEn] || homeEn;
+    const awayEs = NOMBRE_MAP[awayEn] || awayEn;
+    // Indexar en ambas direcciones para mayor robustez
+    apiIndex.set(`${homeEs}|${awayEs}`, f);
+    apiIndex.set(`${awayEs}|${homeEs}`, f);
+  }
+
+  // ── 4. Obtener partidos de eliminatoria de Supabase (con nombres de equipo) ──
+  const { data: dbMatches, error: dbErr } = await supabase
+    .from('matches')
+    .select(`
+      id,
+      match_number,
+      round,
+      wc_api_id,
+      kickoff_utc,
+      home_team:home_team_id ( name ),
+      away_team:away_team_id ( name )
+    `)
+    .not('round', 'eq', 'group');
+
+  if (dbErr || !dbMatches) {
+    console.error('[fixKnockoutIds] ❌ Error al consultar Supabase:', dbErr?.message);
+    return;
+  }
+
+  // ── 5. Cruzar y corregir ────────────────────────────────────────
+  let fixed = 0;
+  let unchanged = 0;
+  let notFound = 0;
+
+  for (const match of dbMatches) {
+    const homeName = match.home_team?.name;
+    const awayName = match.away_team?.name;
+
+    // Saltar partidos sin equipos asignados (aún sin sembrar)
+    if (!homeName || !awayName) continue;
+
+    const key = `${homeName}|${awayName}`;
+    const fixture = apiIndex.get(key);
+
+    if (!fixture) {
+      console.warn(`[fixKnockoutIds] ⚠️  No se encontró partido para: ${homeName} vs ${awayName}`);
+      notFound++;
+      continue;
+    }
+
+    const newApiId   = String(fixture.fixture.id);
+    const rawDate    = fixture.fixture?.date ? new Date(fixture.fixture.date) : null;
+    const newKickoff = (rawDate && rawDate.getFullYear() >= 2026)
+      ? rawDate.toISOString()
+      : null;
+
+    const updatePayload = {};
+    if (newApiId && newApiId !== match.wc_api_id)           updatePayload.wc_api_id   = newApiId;
+    if (newKickoff && newKickoff !== match.kickoff_utc)     updatePayload.kickoff_utc = newKickoff;
+
+    if (Object.keys(updatePayload).length === 0) {
+      unchanged++;
+      continue;
+    }
+
+    const { error: upErr } = await supabase
+      .from('matches')
+      .update(updatePayload)
+      .eq('id', match.id);
+
+    if (upErr) {
+      console.error(`[fixKnockoutIds] ❌ Error actualizando Partido #${match.match_number}:`, upErr.message);
+    } else {
+      const idPart = updatePayload.wc_api_id ? ` → wc_api_id: ${newApiId}` : '';
+      console.log(`[fixKnockoutIds] ✅ Partido #${match.match_number} ${homeName} vs ${awayName}${idPart}`);
+      fixed++;
+    }
+  }
+
+  console.log(`[fixKnockoutIds] 🏁 Resultado: ${fixed} corregidos, ${unchanged} sin cambios, ${notFound} no encontrados en API.`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  ARRANQUE
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1928,6 +2071,9 @@ if (startIdx !== -1) {
     // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
     syncKnockoutFixtures();
     setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
+
+    // Corrección de wc_api_id incorrectos — solo una vez al arrancar
+    fixKnockoutApiIds();
   }).catch(err => {
     console.error('❌ Error fatal al iniciar simulación:', err);
     process.exit(1);
@@ -1949,6 +2095,9 @@ if (startIdx !== -1) {
   // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
   syncKnockoutFixtures();
   setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
+
+  // Corrección de wc_api_id incorrectos — solo una vez al arrancar
+  fixKnockoutApiIds();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
