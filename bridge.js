@@ -2020,7 +2020,94 @@ async function fixKnockoutApiIds() {
     }
   }
 
-  console.log(`[fixKnockoutIds] 🏁 Resultado: ${fixed} corregidos, ${unchanged} sin cambios, ${notFound} no encontrados en API.`);
+  // ── 6. Segunda pasada: partidos sin equipos asignados (cruzar por posición) ──
+  const ROUND_MAP = {
+    'Round of 16': 'R16',
+    'Quarter-finals': 'QF',
+    'Semi-finals': 'SF',
+    '3rd Place Final': '3rd',
+    'Final': 'final'
+  };
+
+  // Agrupar fixtures de la API por round
+  const apiFixturesByDbRound = {};
+  for (const f of knockoutFixtures) {
+    const apiRound = f.league?.round;
+    const dbRoundKey = ROUND_MAP[apiRound];
+    if (dbRoundKey) {
+      if (!apiFixturesByDbRound[dbRoundKey]) {
+        apiFixturesByDbRound[dbRoundKey] = [];
+      }
+      apiFixturesByDbRound[dbRoundKey].push(f);
+    }
+  }
+
+  // Ordenar fixtures cronológicamente en cada round
+  for (const rKey in apiFixturesByDbRound) {
+    apiFixturesByDbRound[rKey].sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
+  }
+
+  // Agrupar matches de Supabase sin equipos por round
+  const dbMatchesNoTeamsByRound = {};
+  for (const match of dbMatches) {
+    if (!match.home_team || !match.away_team) {
+      const r = match.round;
+      if (!dbMatchesNoTeamsByRound[r]) {
+        dbMatchesNoTeamsByRound[r] = [];
+      }
+      dbMatchesNoTeamsByRound[r].push(match);
+    }
+  }
+
+  // Ordenar matches por match_number
+  for (const rKey in dbMatchesNoTeamsByRound) {
+    dbMatchesNoTeamsByRound[rKey].sort((a, b) => a.match_number - b.match_number);
+  }
+
+  let positionFixed = 0;
+  for (const [dbRoundKey, matchesList] of Object.entries(dbMatchesNoTeamsByRound)) {
+    const apiFixturesList = apiFixturesByDbRound[dbRoundKey] || [];
+    const limit = Math.min(matchesList.length, apiFixturesList.length);
+
+    if (limit > 0) {
+      console.log(`[fixKnockoutIds] 🔗 Vinculando ${limit} partidos sin equipos en ${dbRoundKey} por orden de posición...`);
+    }
+
+    for (let i = 0; i < limit; i++) {
+      const match = matchesList[i];
+      const fixture = apiFixturesList[i];
+
+      const newApiId = String(fixture.fixture.id);
+      const rawDate = fixture.fixture?.date ? new Date(fixture.fixture.date) : null;
+      const newKickoff = (rawDate && rawDate.getFullYear() >= 2026)
+        ? rawDate.toISOString()
+        : null;
+
+      const updatePayload = {};
+      if (newApiId && newApiId !== match.wc_api_id)           updatePayload.wc_api_id   = newApiId;
+      if (newKickoff && newKickoff !== match.kickoff_utc)     updatePayload.kickoff_utc = newKickoff;
+
+      if (Object.keys(updatePayload).length === 0) {
+        unchanged++;
+        continue;
+      }
+
+      const { error: upErr } = await supabase
+        .from('matches')
+        .update(updatePayload)
+        .eq('id', match.id);
+
+      if (upErr) {
+        console.error(`[fixKnockoutIds] ❌ Error actualizando por posición Partido #${match.match_number}:`, upErr.message);
+      } else {
+        console.log(`[fixKnockoutIds] ✅ Asignado por posición Partido #${match.match_number} (${dbRoundKey} [${i}]) → wc_api_id: ${newApiId}`);
+        positionFixed++;
+        fixed++;
+      }
+    }
+  }
+
+  console.log(`[fixKnockoutIds] 🏁 Resultado: ${fixed} corregidos (${positionFixed} por posición), ${unchanged} sin cambios, ${notFound} no encontrados en API.`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
