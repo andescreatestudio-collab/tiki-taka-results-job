@@ -1210,8 +1210,10 @@ async function tick() {
           console.log(`[cron] Procesando Partido #${match.match_number} (${match.round}) — kickoff: ${match.kickoff_utc}`);
           const kickoff = new Date(match.kickoff_utc);
 
-          if (kickoff < WC_REAL_START && API_MODE !== 'test') {
-            console.log(`[cron] Partido #${match.match_number} tiene kickoff anterior a ${WC_REAL_START.toISOString()}, ignorando (sin datos API).`);
+          if (kickoff < WC_REAL_START && API_MODE !== 'test' && !KNOCKOUT_ROUNDS.has(match.round)) {
+            // Solo bloquear partidos de grupos con fecha antigua — los de eliminatoria
+            // pueden tener kickoff_utc incorrecto hasta que syncKnockoutFixtures los corrija.
+            console.log(`[cron] Partido #${match.match_number} (grupo) tiene kickoff anterior a ${WC_REAL_START.toISOString()}, ignorando (sin datos API).`);
           } else if (!match.wc_api_id) {
             // Auto-sincronización de wc_api_id para eliminatorias
             const isKnockout = ['R32', 'R16', 'QF', 'SF', '3rd', 'final'].includes(match.round);
@@ -1819,9 +1821,16 @@ async function syncKnockoutFixtures() {
 
       const apiHomeNameEn = fixture.teams?.home?.name;
       const apiAwayNameEn = fixture.teams?.away?.name;
-      const apiKickoff    = fixture.fixture?.date
-        ? new Date(fixture.fixture.date).toISOString()
+
+      // Extraer kickoff y validar que sea de 2026 (descarta fixtures incorrectos de años anteriores)
+      const rawDate = fixture.fixture?.date ? new Date(fixture.fixture.date) : null;
+      const apiKickoff = (rawDate && rawDate.getFullYear() >= 2026)
+        ? rawDate.toISOString()
         : null;
+
+      if (fixture.fixture?.date && !apiKickoff) {
+        console.warn(`[syncKnockout] ⚠️  Partido #${match.match_number} — la API devuelvió kickoff de ${rawDate.getFullYear()} (wc_api_id posiblemente incorrecto). kickoff_utc no se actualizará.`);
+      }
 
       const homeId = resolveTeamId(apiHomeNameEn);
       const awayId = resolveTeamId(apiAwayNameEn);
