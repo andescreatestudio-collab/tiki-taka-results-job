@@ -1729,6 +1729,149 @@ async function syncFixtures() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  SYNC DE EMPAREJAMIENTOS DE ELIMINATORIA (cada 6 horas)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Sincroniza los emparejamientos reales (home_team_id, away_team_id, kickoff_utc)
+ * de los partidos de eliminatoria consultando API-Football por su wc_api_id.
+ *
+ * Solo actúa sobre partidos de eliminatoria que ya tienen wc_api_id asignado.
+ * Ignora equipos con nombres placeholder (TBD, Winner of…, etc.).
+ * No modifica partidos ya terminados.
+ *
+ * Se ejecuta al arrancar (después de syncFixtures) y cada 6 horas.
+ */
+async function syncKnockoutFixtures() {
+  // En modo simulación no hay API que consultar
+  if (!USE_API) {
+    console.log('[syncKnockout] ℹ️  Modo simulación — sync de eliminatorias omitido.');
+    return;
+  }
+
+  console.log('\n[syncKnockout] ⏳ Sincronizando emparejamientos reales de eliminatorias...');
+
+  // ── 1. Partidos de eliminatoria con wc_api_id asignado ────────────────────
+  const { data: knockoutMatches, error: matchesErr } = await supabase
+    .from('matches')
+    .select('id, match_number, wc_api_id, round, home_team_id, away_team_id, kickoff_utc, status')
+    .not('wc_api_id', 'is', null)
+    .not('round', 'eq', 'group');
+
+  if (matchesErr || !knockoutMatches) {
+    console.error('[syncKnockout] ❌ Error al obtener partidos de eliminatoria:', matchesErr?.message);
+    return;
+  }
+
+  if (knockoutMatches.length === 0) {
+    console.log('[syncKnockout] ℹ️  No hay partidos de eliminatoria con wc_api_id asignado.');
+    return;
+  }
+
+  console.log(`[syncKnockout] 🔍 Procesando ${knockoutMatches.length} partidos de eliminatoria...`);
+
+  // ── 2. Cargar equipos de Supabase y construir mapa nombre→id ─────────────
+  const { data: dbTeams, error: teamsErr } = await supabase
+    .from('teams')
+    .select('id, name, code');
+
+  if (teamsErr || !dbTeams) {
+    console.error('[syncKnockout] ❌ Error al obtener equipos:', teamsErr?.message);
+    return;
+  }
+
+  // Mapa nombre español (lowercase) → team_id
+  const teamIdByName = {};
+  for (const t of dbTeams) {
+    teamIdByName[t.name.toLowerCase()] = t.id;
+  }
+
+  // Helper: detecta nombres placeholder de la API (TBD, Winner of…, etc.)
+  const isPlaceholder = (name) => {
+    if (!name) return true;
+    const n = name.toLowerCase();
+    return n === 'tbd' || n.includes('winner') || n.includes('runner') ||
+           n.includes('loser') || n.includes('group') || n === 'to be decided';
+  };
+
+  // Helper: inglés API-Football → team_id Supabase
+  // Usa NOMBRE_MAP (inglés→español) para encontrar el nombre en la BD.
+  const resolveTeamId = (apiNameEn) => {
+    if (isPlaceholder(apiNameEn)) return null;
+    const nameEs = NOMBRE_MAP[apiNameEn] || apiNameEn;
+    return teamIdByName[nameEs.toLowerCase()] || null;
+  };
+
+  // ── 3. Consultar API por cada partido y actualizar si hay cambios ─────────
+  let updated = 0;
+  let skipped = 0;
+
+  for (const match of knockoutMatches) {
+    try {
+      const result = await getApiResult(match.wc_api_id);
+      const fixture = result?.rawFixture;
+
+      if (!fixture) {
+        console.warn(`[syncKnockout] ⚠️  Partido #${match.match_number} — fixture no encontrado en API.`);
+        skipped++;
+        continue;
+      }
+
+      const apiHomeNameEn = fixture.teams?.home?.name;
+      const apiAwayNameEn = fixture.teams?.away?.name;
+      const apiKickoff    = fixture.fixture?.date
+        ? new Date(fixture.fixture.date).toISOString()
+        : null;
+
+      const homeId = resolveTeamId(apiHomeNameEn);
+      const awayId = resolveTeamId(apiAwayNameEn);
+
+      // Construir payload solo con campos que realmente cambiaron
+      const updatePayload = {};
+      if (homeId && homeId !== match.home_team_id) updatePayload.home_team_id = homeId;
+      if (awayId && awayId !== match.away_team_id)  updatePayload.away_team_id  = awayId;
+      if (apiKickoff && apiKickoff !== match.kickoff_utc) updatePayload.kickoff_utc = apiKickoff;
+
+      if (Object.keys(updatePayload).length === 0) {
+        skipped++;
+        continue; // Sin cambios
+      }
+
+      // Log legible: nombre anterior → nombre nuevo
+      const prevHome = match.home_team_id
+        ? (dbTeams.find(t => t.id === match.home_team_id)?.name ?? '?') : '?';
+      const prevAway = match.away_team_id
+        ? (dbTeams.find(t => t.id === match.away_team_id)?.name ?? '?') : '?';
+      const newHome  = homeId
+        ? (dbTeams.find(t => t.id === homeId)?.name || apiHomeNameEn) : prevHome;
+      const newAway  = awayId
+        ? (dbTeams.find(t => t.id === awayId)?.name || apiAwayNameEn) : prevAway;
+
+      console.log(`[syncKnockout] Actualizando partido #${match.match_number}: ${prevHome} vs ${prevAway} → ${newHome} vs ${newAway}`);
+
+      const { error: upErr } = await supabase
+        .from('matches')
+        .update(updatePayload)
+        .eq('id', match.id);
+
+      if (upErr) {
+        console.error(`[syncKnockout] ❌ Error actualizando partido #${match.match_number}:`, upErr.message);
+      } else {
+        updated++;
+      }
+
+      // Pausa de 500ms entre requests para no saturar la API
+      await new Promise(r => setTimeout(r, 500));
+    } catch (err) {
+      console.error(`[syncKnockout] ❌ Error en partido #${match.match_number}:`, err.message);
+      skipped++;
+    }
+  }
+
+  console.log(`[syncKnockout] ✅ ${updated} partidos actualizados, ${skipped} sin cambios o con error.`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  ARRANQUE
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1772,6 +1915,10 @@ if (startIdx !== -1) {
     // Sync diario de kickoffs (al arrancar + cada 24h)
     syncFixtures();
     setInterval(syncFixtures, 24 * 60 * 60 * 1000);
+
+    // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
+    syncKnockoutFixtures();
+    setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
   }).catch(err => {
     console.error('❌ Error fatal al iniciar simulación:', err);
     process.exit(1);
@@ -1789,6 +1936,10 @@ if (startIdx !== -1) {
   // Sync diario de kickoffs (al arrancar + cada 24h)
   syncFixtures();
   setInterval(syncFixtures, 24 * 60 * 60 * 1000);
+
+  // Sync de emparejamientos de eliminatoria (al arrancar + cada 6h)
+  syncKnockoutFixtures();
+  setInterval(syncKnockoutFixtures, 6 * 60 * 60 * 1000);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
