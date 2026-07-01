@@ -2083,6 +2083,19 @@ async function fixKnockoutApiIds() {
         ? rawDate.toISOString()
         : null;
 
+      // Verificar que este wc_api_id no esté ya asignado a otro partido
+      const { data: existing } = await supabase
+        .from('matches')
+        .select('id, match_number')
+        .eq('wc_api_id', newApiId)
+        .single();
+
+      if (existing) {
+        console.log(`[fixKnockoutIds] ⏭️ wc_api_id ${newApiId} ya asignado al partido #${existing.match_number}, saltando #${match.match_number}`);
+        unchanged++;
+        continue;
+      }
+
       const updatePayload = {};
       if (newApiId && newApiId !== match.wc_api_id)           updatePayload.wc_api_id   = newApiId;
       if (newKickoff && newKickoff !== match.kickoff_utc)     updatePayload.kickoff_utc = newKickoff;
